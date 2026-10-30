@@ -9,9 +9,8 @@
 //   pesymp.exe CreateFile C:\Windows\System32\kernel32.dll
 //   pesymp.exe -r "Api.*Buffer" app.exe other.dll
 //   pesymp.exe -l app.exe          (list all symbols)
-//   pesymp.exe -a WinVerifyTrust app.exe  (addresses only)
-//   pesymp.exe -n CreateFile kernel32.dll  (names only)
-//   pesymp.exe -f json -l app.exe > output.json
+//   pesymp.exe -t thunk -q --addr va WinVerifyTrust app.exe  (VA of thunks only)
+//   pesymp.exe -t export -t import -f json -l app.exe > output.json
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -27,11 +26,13 @@ internal static class Pesym
         public bool Regex;
         public bool IgnoreCase = true;
         public bool All;
-        public bool ExportsOnly;
-        public bool CoffOnly;
+        
+        // Таблицы для поиска (export, import, coff, thunk, thunk-call, all)
+        public HashSet<string> Tables = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "all" };
         
         // Опции для гибкого вывода
-        public bool AddressesOnly;
+        public bool Quiet;
+        public string AddrType = "offset"; // rva, va, offset
         public bool NamesOnly;
         public bool NoHeader;
         public string Format = "table"; // table, raw, csv, json
@@ -266,12 +267,12 @@ internal static class Pesym
             {
                 var results = AnalyzeFile(file, regex, opt);
                 if (results == null) { exitCode = 1; continue; }
-                if (opt.Format == "json") allResults.AddRange(results);
+                if (opt.Format == "json" && !opt.Quiet) allResults.AddRange(results);
             }
         }
 
         // Безопасный вывод JSON без использования форматных строк Console.WriteLine
-        if (opt.Format == "json" && allResults.Count > 0)
+        if (opt.Format == "json" && !opt.Quiet && allResults.Count > 0)
         {
             Console.WriteLine("[");
             for (int i = 0; i < allResults.Count; i++)
@@ -315,20 +316,19 @@ internal static class Pesym
         Console.WriteLine("  -r               treat pattern as regular expression");
         Console.WriteLine("  -c               case-sensitive search");
         Console.WriteLine("  -l               list all symbols (pattern not needed)");
-        Console.WriteLine("  -x               export table only");
-        Console.WriteLine("  -s               COFF symbol table only");
+        Console.WriteLine("  -t <table>       search in specific table: export, import, coff, thunk, thunk-call, all (default)");
         Console.WriteLine();
         Console.WriteLine("Output options:");
-        Console.WriteLine("  -a               output addresses only (one per line)");
+        Console.WriteLine("  -q               quiet mode (output addresses only)");
+        Console.WriteLine("  --addr <type>    address type for quiet mode: rva, va, offset (default)");
         Console.WriteLine("  -n               output names only (one per line)");
         Console.WriteLine("  --no-header      suppress table headers");
         Console.WriteLine("  -f <format>      output format: table (default), raw, csv, json");
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine("  pesymp.exe CreateFile kernel32.dll");
-        Console.WriteLine("  pesymp.exe -a WinVerifyTrust app.exe > addresses.txt");
-        Console.WriteLine("  pesymp.exe -n -l app.exe > all_symbols.txt");
-        Console.WriteLine("  pesymp.exe -f json -l app.exe > output.json");
+        Console.WriteLine("  pesymp.exe -t thunk -q --addr va WinVerifyTrust app.exe");
+        Console.WriteLine("  pesymp.exe -t export -t import -n -l app.exe > names.txt");
     }
 
     private static Options ParseArgs(string[] args)
@@ -340,9 +340,38 @@ internal static class Pesym
             if (a == "-r" || a == "/r") opt.Regex = true;
             else if (a == "-c" || a == "/c") opt.IgnoreCase = false;
             else if (a == "-l" || a == "/l") opt.All = true;
-            else if (a == "-x" || a == "/x") opt.ExportsOnly = true;
-            else if (a == "-s" || a == "/s") opt.CoffOnly = true;
-            else if (a == "-a" || a == "/a" || a == "--addresses-only") opt.AddressesOnly = true;
+            
+            // Новый аргумент для выбора таблицы
+            else if (a == "-t" || a == "/t" || a == "--table")
+            {
+                if (i + 1 >= args.Length) throw new Exception("missing table name after -t");
+                string tbl = args[++i].ToLower();
+                if (tbl == "all") 
+                { 
+                    opt.Tables.Clear(); 
+                    opt.Tables.Add("all"); 
+                }
+                else if (tbl == "export" || tbl == "import" || tbl == "coff" || tbl == "thunk" || tbl == "thunk-call")
+                {
+                    opt.Tables.Remove("all");
+                    opt.Tables.Add(tbl);
+                }
+                else throw new Exception("unknown table: " + tbl + ". Use export, import, coff, thunk, thunk-call, or all.");
+            }
+            
+            // Quiet mode
+            else if (a == "-q" || a == "/q" || a == "--quiet") opt.Quiet = true;
+            
+            // Тип адреса для quiet mode
+            else if (a == "--addr")
+            {
+                if (i + 1 >= args.Length) throw new Exception("missing address type after --addr");
+                string at = args[++i].ToLower();
+                if (at != "rva" && at != "va" && at != "offset")
+                    throw new Exception("unknown address type: " + at + ". Use rva, va, or offset.");
+                opt.AddrType = at;
+            }
+
             else if (a == "-n" || a == "/n" || a == "--names-only") opt.NamesOnly = true;
             else if (a == "--no-header") opt.NoHeader = true;
             else if (a == "-f" || a == "/f" || a == "--format")
@@ -361,8 +390,6 @@ internal static class Pesym
 
         if (!opt.All && opt.Pattern == null) throw new Exception("no pattern given (or use -l)");
         if (opt.Files.Count == 0) throw new Exception("no input file given");
-        if (opt.ExportsOnly && opt.CoffOnly) throw new Exception("-x and -s are mutually exclusive");
-        if (opt.AddressesOnly && opt.NamesOnly) throw new Exception("-a and -n are mutually exclusive");
         
         return opt;
     }
@@ -390,28 +417,38 @@ internal static class Pesym
                 return null;
             }
 
+            bool searchAll = opt.Tables.Contains("all");
+            bool searchExport = searchAll || opt.Tables.Contains("export");
+            bool searchImport = searchAll || opt.Tables.Contains("import");
+            bool searchCoff = searchAll || opt.Tables.Contains("coff");
+            bool searchThunks = searchAll || opt.Tables.Contains("thunk") || opt.Tables.Contains("thunk-call");
+
             var symbols = new List<Symbol>();
             List<Symbol> imports = null;
 
-            if (!opt.CoffOnly)
+            if (searchExport)
             {
                 try { symbols.AddRange(pe.GetExports()); }
                 catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); }
             }
-
-            if (!opt.ExportsOnly)
+            
+            if (searchImport || searchThunks)
             {
-                try { imports = pe.GetImports(); symbols.AddRange(imports); }
+                try 
+                { 
+                    imports = pe.GetImports(); 
+                    if (searchImport) symbols.AddRange(imports); 
+                }
                 catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: import table error: {1}", path, ex.Message); }
             }
-
-            if (!opt.ExportsOnly)
+            
+            if (searchCoff)
             {
                 try { symbols.AddRange(pe.GetCoffSymbols()); }
                 catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); }
             }
-
-            if (imports != null)
+            
+            if (searchThunks && imports != null)
             {
                 try { symbols.AddRange(pe.GetImportThunks(imports)); }
                 catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); }
@@ -423,6 +460,10 @@ internal static class Pesym
             foreach (Symbol sym in symbols)
             {
                 if (sym == null || string.IsNullOrEmpty(sym.Name)) continue;
+                
+                // Фильтрация по запрошенным таблицам (например, отсечь thunk, если просили только thunk-call)
+                if (!searchAll && !opt.Tables.Contains(sym.Source)) continue;
+
                 if (regex != null && !regex.IsMatch(sym.Name)) continue;
 
                 try
@@ -432,6 +473,18 @@ internal static class Pesym
                     long? fileOffset = sym.RvaBased
                         ? pe.RvaToFileOffset(rva)
                         : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : (long?)null);
+
+                    // Если включен Quiet mode, просто печатаем нужный адрес и идем дальше
+                    if (opt.Quiet)
+                    {
+                        string outAddr = "-";
+                        if (opt.AddrType == "rva") outAddr = rva != 0 ? "0x" + rva.ToString("X") : "-";
+                        else if (opt.AddrType == "va") outAddr = va != 0 ? "0x" + va.ToString("X") : "-";
+                        else if (opt.AddrType == "offset") outAddr = fileOffset.HasValue ? "0x" + fileOffset.Value.ToString("X") : "-";
+                        
+                        Console.WriteLine(outAddr);
+                        continue;
+                    }
 
                     // Инициализация словаря, совместимая с C# 5.0
                     var result = new Dictionary<string, object>();
@@ -448,13 +501,7 @@ internal static class Pesym
                     // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
                     if (opt.Format == "json") continue;
 
-                    if (opt.AddressesOnly)
-                    {
-                        if (fileOffset.HasValue) Console.WriteLine("0x{0:X}", fileOffset.Value);
-                        else if (va != 0) Console.WriteLine("0x{0:X}", va);
-                        else if (rva != 0) Console.WriteLine("0x{0:X}", rva);
-                    }
-                    else if (opt.NamesOnly)
+                    if (opt.NamesOnly)
                     {
                         Console.WriteLine(sym.Name);
                     }
