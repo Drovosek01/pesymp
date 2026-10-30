@@ -11,6 +11,8 @@
 //   pesymp.exe -l app.exe          (list all symbols)
 //   pesymp.exe -t thunk -q --addr va WinVerifyTrust app.exe  (VA of thunks only)
 //   pesymp.exe -t export -t import -f json -l app.exe > output.json
+//   pesymp.exe CreateFile kernel32.dll -x 909090             (patch found offsets)
+//   pesymp.exe -x 909090 -- 0x10002a704 file.exe             (patch by direct offset)
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -36,6 +38,10 @@ internal static class Pesym
         public bool NamesOnly;
         public bool NoHeader;
         public string Format = "table"; // table, raw, csv, json
+        
+        // Опции для патчинга
+        public byte[] PatchData;
+        public long? PatchOffset;
     }
 
     private sealed class Section
@@ -235,6 +241,36 @@ internal static class Pesym
         
         if (opt == null) { PrintUsage(); return 0; }
 
+        // Режим прямого патчинга по указанному адресу
+        if (opt.PatchData != null && opt.PatchOffset.HasValue)
+        {
+            int exitCode = 0;
+            foreach (string file in opt.Files)
+            {
+                try
+                {
+                    using (var fs = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    {
+                        long off = opt.PatchOffset.Value;
+                        if (off < 0 || off + opt.PatchData.Length > fs.Length)
+                            throw new Exception(string.Format("offset 0x{0:X} + {1} bytes out of file bounds (size: {2})", off, opt.PatchData.Length, fs.Length));
+                        
+                        fs.Seek(off, SeekOrigin.Begin);
+                        fs.Write(opt.PatchData, 0, opt.PatchData.Length);
+                        
+                        if (!opt.Quiet)
+                            Console.WriteLine("Patched {0} at offset 0x{1:X} with {2} bytes", file, off, opt.PatchData.Length);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("pesym: {0}: patch failed: {1}", file, ex.Message);
+                    exitCode = 1;
+                }
+            }
+            return exitCode;
+        }
+
         Regex regex = null;
         if (!opt.All)
         {
@@ -245,7 +281,7 @@ internal static class Pesym
                 : new Regex(Regex.Escape(opt.Pattern), opts);
         }
 
-        int exitCode = 0;
+        int exitCodeSearch = 0;
         var allResults = new List<Dictionary<string, object>>();
 
         foreach (string fileSpec in opt.Files)
@@ -266,7 +302,7 @@ internal static class Pesym
             foreach (string file in files)
             {
                 var results = AnalyzeFile(file, regex, opt);
-                if (results == null) { exitCode = 1; continue; }
+                if (results == null) { exitCodeSearch = 1; continue; }
                 if (opt.Format == "json" && !opt.Quiet) allResults.AddRange(results);
             }
         }
@@ -294,7 +330,7 @@ internal static class Pesym
             Console.WriteLine("]");
         }
 
-        return exitCode;
+        return exitCodeSearch;
     }
 
     private static string EscapeJson(string s)
@@ -318,6 +354,11 @@ internal static class Pesym
         Console.WriteLine("  -l               list all symbols (pattern not needed)");
         Console.WriteLine("  -t <table>       search in specific table: export, import, coff, thunk, thunk-call, all (default)");
         Console.WriteLine();
+        Console.WriteLine("Patch options:");
+        Console.WriteLine("  -x, --hex <data> patch found offsets (or specified address) with hex data");
+        Console.WriteLine("                   (case-insensitive, spaces allowed, e.g. -x \"90 90 90\" or -x 31c0c3)");
+        Console.WriteLine("  --               separate options from positional arguments (pattern/address and files)");
+        Console.WriteLine();
         Console.WriteLine("Output options:");
         Console.WriteLine("  -q               quiet mode (output addresses only)");
         Console.WriteLine("  --addr <type>    address type for quiet mode: rva, va, offset (default)");
@@ -327,8 +368,8 @@ internal static class Pesym
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine("  pesymp.exe CreateFile kernel32.dll");
-        Console.WriteLine("  pesymp.exe -t thunk -q --addr va WinVerifyTrust app.exe");
-        Console.WriteLine("  pesymp.exe -t export -t import -n -l app.exe > names.txt");
+        Console.WriteLine("  pesymp.exe CreateFile kernel32.dll -x 909090");
+        Console.WriteLine("  pesymp.exe -x 909090 -- 0x10002a704 file.exe");
     }
 
     private static Options ParseArgs(string[] args)
@@ -371,7 +412,6 @@ internal static class Pesym
                     throw new Exception("unknown address type: " + at + ". Use rva, va, or offset.");
                 opt.AddrType = at;
             }
-
             else if (a == "-n" || a == "/n" || a == "--names-only") opt.NamesOnly = true;
             else if (a == "--no-header") opt.NoHeader = true;
             else if (a == "-f" || a == "/f" || a == "--format")
@@ -381,34 +421,63 @@ internal static class Pesym
                 if (opt.Format != "table" && opt.Format != "raw" && opt.Format != "csv" && opt.Format != "json")
                     throw new Exception("unknown format: " + opt.Format);
             }
+            else if (a == "-x" || a == "/x" || a == "--hex")
+            {
+                if (i + 1 >= args.Length) throw new Exception("missing hex data after -x");
+                try { opt.PatchData = ParseHex(args[++i]); }
+                catch (Exception ex) { throw new Exception("invalid hex data: " + ex.Message); }
+            }
+            else if (a == "--")
+            {
+                // Все последующие аргументы считаем позиционными
+                for (int j = i + 1; j < args.Length; j++)
+                {
+                    string posArg = args[j];
+                    if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(posArg))
+                    {
+                        opt.PatchOffset = ParseAddress(posArg);
+                    }
+                    else if (opt.Pattern == null && !opt.All && opt.PatchOffset == null)
+                    {
+                        opt.Pattern = posArg;
+                    }
+                    else
+                    {
+                        opt.Files.Add(posArg);
+                    }
+                }
+                break; // Завершаем основной цикл парсинга
+            }
             else if (a == "-h" || a == "/h" || a == "--help") return null;
             else if (a.Length > 1 && (a[0] == '-' || a[0] == '/'))
                 throw new Exception("unknown option: " + a);
-            else if (opt.Pattern == null && !opt.All) opt.Pattern = a;
+            else if (opt.Pattern == null && !opt.All)
+            {
+                // Поддержка адреса без явного использования "--"
+                if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(a))
+                    opt.PatchOffset = ParseAddress(a);
+                else
+                    opt.Pattern = a;
+            }
             else opt.Files.Add(a);
         }
 
-        if (!opt.All && opt.Pattern == null) throw new Exception("no pattern given (or use -l)");
-        if (opt.Files.Count == 0) throw new Exception("no input file given");
-        
+        if (!opt.All && opt.Pattern == null && !opt.PatchOffset.HasValue) 
+            throw new Exception("no pattern given (or use -l, or specify address with -x)");
+        if (opt.Files.Count == 0) 
+            throw new Exception("no input file given");
+            
         return opt;
     }
 
     private static List<Dictionary<string, object>> AnalyzeFile(string path, Regex regex, Options opt)
     {
         PeReader reader = null;
+        var offsetsToPatch = new HashSet<long>();
+        List<Dictionary<string, object>> results = null;
         try
         {
             reader = new PeReader(path);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine("pesym: cannot read {0}: {1}", path, ex.Message);
-            return null;
-        }
-
-        try
-        {
             PeImage pe;
             try { pe = PeImage.Parse(reader); }
             catch (Exception ex)
@@ -426,35 +495,15 @@ internal static class Pesym
             var symbols = new List<Symbol>();
             List<Symbol> imports = null;
 
-            if (searchExport)
-            {
-                try { symbols.AddRange(pe.GetExports()); }
-                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); }
-            }
-            
-            if (searchImport || searchThunks)
-            {
-                try 
-                { 
-                    imports = pe.GetImports(); 
-                    if (searchImport) symbols.AddRange(imports); 
-                }
+            if (searchExport) { try { symbols.AddRange(pe.GetExports()); } catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); } }
+            if (searchImport || searchThunks) {
+                try { imports = pe.GetImports(); if (searchImport) symbols.AddRange(imports); } 
                 catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: import table error: {1}", path, ex.Message); }
             }
-            
-            if (searchCoff)
-            {
-                try { symbols.AddRange(pe.GetCoffSymbols()); }
-                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); }
-            }
-            
-            if (searchThunks && imports != null)
-            {
-                try { symbols.AddRange(pe.GetImportThunks(imports)); }
-                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); }
-            }
+            if (searchCoff) { try { symbols.AddRange(pe.GetCoffSymbols()); } catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); } }
+            if (searchThunks && imports != null) { try { symbols.AddRange(pe.GetImportThunks(imports)); } catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); } }
 
-            var results = new List<Dictionary<string, object>>();
+            results = new List<Dictionary<string, object>>();
             bool printedHeader = false;
 
             foreach (Symbol sym in symbols)
@@ -474,6 +523,11 @@ internal static class Pesym
                         ? pe.RvaToFileOffset(rva)
                         : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : (long?)null);
 
+                    if (fileOffset.HasValue && opt.PatchData != null)
+                    {
+                        offsetsToPatch.Add(fileOffset.Value);
+                    }
+                    
                     // Если включен Quiet mode, просто печатаем нужный адрес и идем дальше
                     if (opt.Quiet)
                     {
@@ -501,53 +555,60 @@ internal static class Pesym
                     // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
                     if (opt.Format == "json") continue;
 
-                    if (opt.NamesOnly)
-                    {
-                        Console.WriteLine(sym.Name);
-                    }
-                    else if (opt.Format == "raw")
-                    {
-                        Console.WriteLine("{0}\t{1}\t{2}\t{3}\t{4}\t{5}",
-                            sym.Source, sym.Name, result["rva"], result["va"], result["offset"], result["section"]);
-                    }
+                    if (opt.NamesOnly) Console.WriteLine(sym.Name);
+                    else if (opt.Format == "raw") Console.WriteLine("{0}\t{1}\t{2}\t{3}\t{4}\t{5}", sym.Source, sym.Name, result["rva"], result["va"], result["offset"], result["section"]);
                     else if (opt.Format == "csv")
                     {
-                        if (!printedHeader && !opt.NoHeader)
-                        {
-                            Console.WriteLine("file,source,name,rva,va,offset,section");
-                            printedHeader = true;
-                        }
-                        Console.WriteLine("{0},{1},{2},{3},{4},{5},{6}",
-                            EscapeCsv(path), EscapeCsv(sym.Source), EscapeCsv(sym.Name),
-                            result["rva"], result["va"], result["offset"],
-                            EscapeCsv(result["section"].ToString()));
+                        if (!printedHeader && !opt.NoHeader) { Console.WriteLine("file,source,name,rva,va,offset,section"); printedHeader = true; }
+                        Console.WriteLine("{0},{1},{2},{3},{4},{5},{6}", EscapeCsv(path), EscapeCsv(sym.Source), EscapeCsv(sym.Name), result["rva"], result["va"], result["offset"], EscapeCsv(result["section"].ToString()));
                     }
-                    else // table format
+                    else
                     {
-                        if (!printedHeader && !opt.NoHeader)
-                        {
-                            Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase);
-                            Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                                "Source", "RVA", "VA", "FileOffset", "Section", "Name");
-                            printedHeader = true;
-                        }
-                        Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                            sym.Source, result["rva"], result["va"], result["offset"], result["section"], sym.Name);
+                        if (!printedHeader && !opt.NoHeader) { Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase); Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}", "Source", "RVA", "VA", "FileOffset", "Section", "Name"); printedHeader = true; }
+                        Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}", sym.Source, result["rva"], result["va"], result["offset"], result["section"], sym.Name);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("  {0,-10} <error resolving symbol '{1}': {2}>",
-                        sym.Source, sym.Name, ex.Message);
-                }
+                catch (Exception ex) { Console.WriteLine("  {0,-10} <error resolving symbol '{1}': {2}>", sym.Source, sym.Name, ex.Message); }
             }
-
-            return results;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("pesym: {0}: {1}", path, ex.Message);
+            return null;
         }
         finally
         {
-            if (reader != null) reader.Dispose();
+            if (reader != null) reader.Dispose(); // Закрываем файл для чтения, чтобы освободить для записи
         }
+
+        // Выполняем патчинг после того, как PeReader освободил файл
+        if (opt.PatchData != null && offsetsToPatch.Count > 0)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    foreach (var off in offsetsToPatch)
+                    {
+                        if (off < 0 || off + opt.PatchData.Length > fs.Length)
+                        {
+                            Console.Error.WriteLine("pesym: {0}: patch offset 0x{1:X} out of bounds", path, off);
+                            continue;
+                        }
+                        fs.Seek(off, SeekOrigin.Begin);
+                        fs.Write(opt.PatchData, 0, opt.PatchData.Length);
+                        if (!opt.Quiet)
+                            Console.WriteLine("Patched {0} at offset 0x{1:X} with {2} bytes", path, off, opt.PatchData.Length);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("pesym: {0}: patch failed: {1}", path, ex.Message);
+            }
+        }
+
+        return results;
     }
 
     private static string EscapeCsv(string s)
@@ -556,6 +617,44 @@ internal static class Pesym
         if (s.Contains(",") || s.Contains("\"") || s.Contains("\n"))
             return "\"" + s.Replace("\"", "\"\"") + "\"";
         return s;
+    }
+
+    // ---------------------------------------------------------------------
+    // Hex parsing & Address helpers
+    // ---------------------------------------------------------------------
+    private static byte[] ParseHex(string hex)
+    {
+        if (string.IsNullOrEmpty(hex)) throw new Exception("empty hex data");
+        hex = hex.Replace(" ", "").Replace("-", "");
+        if (hex.Length % 2 != 0)
+            throw new Exception("hex string length must be even");
+        
+        byte[] bytes = new byte[hex.Length / 2];
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+        }
+        return bytes;
+    }
+
+    private static bool IsHexAddress(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length < 3) return false;
+        if (!s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) return false;
+        for (int i = 2; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                return false;
+        }
+        return true;
+    }
+
+    private static long ParseAddress(string s)
+    {
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return Convert.ToInt64(s.Substring(2), 16);
+        return Convert.ToInt64(s, 16);
     }
 
     private sealed class PeImage
