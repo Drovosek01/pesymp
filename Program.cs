@@ -1,15 +1,17 @@
 // pesymp - symbol search in PE files (Windows analog of macOS symp).
-// Scans the export table and the COFF symbol table,
+// Scans the export table, import table, COFF symbol table, and import thunks,
 // prints name, RVA, VA and file offset for each match.
 //
 // Build (see build.ps1):
 //   csc /nologo /optimize+ /out:pesymp.exe Program.cs
 //
 // Examples:
-//   pesymp.exe -i CreateFile C:\Windows\System32\kernel32.dll
+//   pesymp.exe CreateFile C:\Windows\System32\kernel32.dll
 //   pesymp.exe -r "Api.*Buffer" app.exe other.dll
 //   pesymp.exe -l app.exe          (list all symbols)
-
+//   pesymp.exe -a WinVerifyTrust app.exe  (addresses only)
+//   pesymp.exe -n CreateFile kernel32.dll  (names only)
+//   pesymp.exe -f json -l app.exe > output.json
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -27,6 +29,12 @@ internal static class Pesym
         public bool All;
         public bool ExportsOnly;
         public bool CoffOnly;
+        
+        // Опции для гибкого вывода
+        public bool AddressesOnly;
+        public bool NamesOnly;
+        public bool NoHeader;
+        public string Format = "table"; // table, raw, csv, json
     }
 
     private sealed class Section
@@ -37,14 +45,14 @@ internal static class Pesym
         public uint SizeOfRawData;
         public uint PointerToRawData;
         public uint Characteristics;
-        public bool IsExecutable { get { return (Characteristics & 0x20000000) != 0; } } // IMAGE_SCN_MEM_EXEC
+        public bool IsExecutable { get { return (Characteristics & 0x20000000) != 0; } }
     }
 
     private sealed class Symbol
     {
         public string Name;
-        public string Source;   // "export" | "coff"
-        public uint Value;      // RVA (export) or section offset (coff)
+        public string Source;   // "export" | "import" | "coff" | "thunk" | "thunk-call"
+        public uint Value;      // RVA (export/import/thunk) or section offset (coff)
         public string Section;  // section name or ""
         public bool RvaBased;
     }
@@ -52,7 +60,7 @@ internal static class Pesym
     private static int Main(string[] args)
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
-
+        
         Options opt;
         try { opt = ParseArgs(args); }
         catch (Exception ex)
@@ -61,7 +69,7 @@ internal static class Pesym
             PrintUsage();
             return 2;
         }
-
+        
         if (opt == null) { PrintUsage(); return 0; }
 
         Regex regex = null;
@@ -75,6 +83,8 @@ internal static class Pesym
         }
 
         int exitCode = 0;
+        var allResults = new List<Dictionary<string, object>>();
+
         foreach (string fileSpec in opt.Files)
         {
             string[] files;
@@ -92,23 +102,79 @@ internal static class Pesym
 
             foreach (string file in files)
             {
-                if (!AnalyzeFile(file, regex, opt)) exitCode = 1;
+                var results = AnalyzeFile(file, regex, opt);
+                if (results == null)
+                {
+                    exitCode = 1;
+                    continue;
+                }
+                
+                if (opt.Format == "json")
+                {
+                    allResults.AddRange(results);
+                }
             }
         }
+
+        // Безопасный вывод JSON без использования форматных строк Console.WriteLine
+        if (opt.Format == "json" && allResults.Count > 0)
+        {
+            Console.WriteLine("[");
+            for (int i = 0; i < allResults.Count; i++)
+            {
+                var r = allResults[i];
+                Console.Write("  {");
+                Console.Write("\"file\":\"" + EscapeJson(Convert.ToString(r["file"])) + "\",");
+                Console.Write("\"source\":\"" + EscapeJson(Convert.ToString(r["source"])) + "\",");
+                Console.Write("\"name\":\"" + EscapeJson(Convert.ToString(r["name"])) + "\",");
+                Console.Write("\"rva\":\"" + Convert.ToString(r["rva"]) + "\",");
+                Console.Write("\"va\":\"" + Convert.ToString(r["va"]) + "\",");
+                Console.Write("\"offset\":\"" + Convert.ToString(r["offset"]) + "\",");
+                Console.Write("\"section\":\"" + EscapeJson(Convert.ToString(r["section"])) + "\"");
+                
+                // Добавляем запятую для всех элементов, кроме последнего
+                string comma = (i < allResults.Count - 1) ? "," : "";
+                Console.WriteLine("}" + comma);
+            }
+            Console.WriteLine("]");
+        }
+
         return exitCode;
+    }
+
+    private static string EscapeJson(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        return s.Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\n", "\\n")
+                .Replace("\r", "\\r")
+                .Replace("\t", "\\t");
     }
 
     private static void PrintUsage()
     {
         Console.WriteLine("Usage: pesymp [options] <pattern> <file...>");
         Console.WriteLine("  pattern          substring (or -r regexp) of symbol name");
-        Console.WriteLine("Options:");
+        Console.WriteLine();
+        Console.WriteLine("Search options:");
         Console.WriteLine("  -r               treat pattern as regular expression");
         Console.WriteLine("  -c               case-sensitive search");
         Console.WriteLine("  -l               list all symbols (pattern not needed)");
         Console.WriteLine("  -x               export table only");
         Console.WriteLine("  -s               COFF symbol table only");
-        Console.WriteLine("Example: pesymp -i LoadLibrary kernel32.dll myapp.exe");
+        Console.WriteLine();
+        Console.WriteLine("Output options:");
+        Console.WriteLine("  -a               output addresses only (one per line)");
+        Console.WriteLine("  -n               output names only (one per line)");
+        Console.WriteLine("  --no-header      suppress table headers");
+        Console.WriteLine("  -f <format>      output format: table (default), raw, csv, json");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  pesymp.exe CreateFile kernel32.dll");
+        Console.WriteLine("  pesymp.exe -a WinVerifyTrust app.exe > addresses.txt");
+        Console.WriteLine("  pesymp.exe -n -l app.exe > all_symbols.txt");
+        Console.WriteLine("  pesymp.exe -f json -l app.exe > output.json");
     }
 
     private static Options ParseArgs(string[] args)
@@ -122,26 +188,39 @@ internal static class Pesym
             else if (a == "-l" || a == "/l") opt.All = true;
             else if (a == "-x" || a == "/x") opt.ExportsOnly = true;
             else if (a == "-s" || a == "/s") opt.CoffOnly = true;
+            else if (a == "-a" || a == "/a" || a == "--addresses-only") opt.AddressesOnly = true;
+            else if (a == "-n" || a == "/n" || a == "--names-only") opt.NamesOnly = true;
+            else if (a == "--no-header") opt.NoHeader = true;
+            else if (a == "-f" || a == "/f" || a == "--format")
+            {
+                if (i + 1 >= args.Length) throw new Exception("missing format after -f");
+                opt.Format = args[++i].ToLower();
+                if (opt.Format != "table" && opt.Format != "raw" && opt.Format != "csv" && opt.Format != "json")
+                    throw new Exception("unknown format: " + opt.Format);
+            }
             else if (a == "-h" || a == "/h" || a == "--help") return null;
             else if (a.Length > 1 && (a[0] == '-' || a[0] == '/'))
                 throw new Exception("unknown option: " + a);
             else if (opt.Pattern == null && !opt.All) opt.Pattern = a;
             else opt.Files.Add(a);
         }
+
         if (!opt.All && opt.Pattern == null) throw new Exception("no pattern given (or use -l)");
         if (opt.Files.Count == 0) throw new Exception("no input file given");
         if (opt.ExportsOnly && opt.CoffOnly) throw new Exception("-x and -s are mutually exclusive");
+        if (opt.AddressesOnly && opt.NamesOnly) throw new Exception("-a and -n are mutually exclusive");
+        
         return opt;
     }
 
-    private static bool AnalyzeFile(string path, Regex regex, Options opt)
+    private static List<Dictionary<string, object>> AnalyzeFile(string path, Regex regex, Options opt)
     {
         byte[] data;
         try { data = File.ReadAllBytes(path); }
         catch (Exception ex)
         {
             Console.Error.WriteLine("pesym: cannot read {0}: {1}", path, ex.Message);
-            return false;
+            return null;
         }
 
         PeImage pe;
@@ -149,52 +228,100 @@ internal static class Pesym
         catch (Exception ex)
         {
             Console.Error.WriteLine("pesym: {0}: {1}", path, ex.Message);
-            return false;
+            return null;
         }
 
         var symbols = new List<Symbol>();
-
         List<Symbol> imports = null;
+
         if (!opt.CoffOnly)
             try { symbols.AddRange(pe.GetExports()); }
             catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); }
+
         if (!opt.ExportsOnly)
             try { imports = pe.GetImports(); symbols.AddRange(imports); }
             catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: import table error: {1}", path, ex.Message); }
+
         if (!opt.ExportsOnly)
             try { symbols.AddRange(pe.GetCoffSymbols()); }
             catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); }
+
         if (imports != null)
             try { symbols.AddRange(pe.GetImportThunks(imports)); }
             catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); }
 
+        var results = new List<Dictionary<string, object>>();
         bool printedHeader = false;
+
         foreach (Symbol sym in symbols)
         {
             if (sym == null || string.IsNullOrEmpty(sym.Name)) continue;
             if (regex != null && !regex.IsMatch(sym.Name)) continue;
-            if (!printedHeader)
-            {
-                Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase);
-                Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                    "Source", "RVA", "VA", "FileOffset", "Section", "Name");
-                printedHeader = true;
-            }
 
             try
             {
                 uint rva = sym.RvaBased ? sym.Value : 0;
+                ulong va = rva != 0 ? pe.ImageBase + rva : 0;
                 long? fileOffset = sym.RvaBased
                     ? pe.RvaToFileOffset(rva)
-                    : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : null);
+                    : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : (long?)null);
 
-                Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                    sym.Source,
-                    rva != 0 ? "0x" + rva.ToString("X") : "-",
-                    rva != 0 ? "0x" + (pe.ImageBase + rva).ToString("X") : "-",
-                    fileOffset.HasValue ? "0x" + fileOffset.Value.ToString("X") : "?",
-                    sym.Section != null && sym.Section.Length > 0 ? sym.Section : "-",
-                    sym.Name);
+                // Инициализация словаря, совместимая с C# 5.0
+                var result = new Dictionary<string, object>();
+                result.Add("file", path);
+                result.Add("source", sym.Source);
+                result.Add("name", sym.Name);
+                result.Add("rva", rva != 0 ? "0x" + rva.ToString("X") : "-");
+                result.Add("va", va != 0 ? "0x" + va.ToString("X") : "-");
+                result.Add("offset", fileOffset.HasValue ? "0x" + fileOffset.Value.ToString("X") : "?");
+                result.Add("section", sym.Section != null && sym.Section.Length > 0 ? sym.Section : "-");
+
+                results.Add(result);
+
+                // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
+                if (opt.Format == "json") continue;
+
+                if (opt.AddressesOnly)
+                {
+                    if (fileOffset.HasValue)
+                        Console.WriteLine("0x{0:X}", fileOffset.Value);
+                    else if (va != 0)
+                        Console.WriteLine("0x{0:X}", va);
+                    else if (rva != 0)
+                        Console.WriteLine("0x{0:X}", rva);
+                }
+                else if (opt.NamesOnly)
+                {
+                    Console.WriteLine(sym.Name);
+                }
+                else if (opt.Format == "raw")
+                {
+                    Console.WriteLine("{0}\t{1}\t{2}\t{3}\t{4}\t{5}",
+                        sym.Source, sym.Name, result["rva"], result["va"], result["offset"], result["section"]);
+                }
+                else if (opt.Format == "csv")
+                {
+                    if (!printedHeader && !opt.NoHeader)
+                    {
+                        Console.WriteLine("file,source,name,rva,va,offset,section");
+                        printedHeader = true;
+                    }
+                    Console.WriteLine("{0},{1},{2},{3},{4},{5},{6}",
+                        EscapeCsv(path), EscapeCsv(sym.Source), EscapeCsv(sym.Name),
+                        result["rva"], result["va"], result["offset"], EscapeCsv(result["section"].ToString()));
+                }
+                else // table format
+                {
+                    if (!printedHeader && !opt.NoHeader)
+                    {
+                        Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase);
+                        Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
+                            "Source", "RVA", "VA", "FileOffset", "Section", "Name");
+                        printedHeader = true;
+                    }
+                    Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
+                        sym.Source, result["rva"], result["va"], result["offset"], result["section"], sym.Name);
+                }
             }
             catch (Exception ex)
             {
@@ -202,7 +329,16 @@ internal static class Pesym
                     sym.Source, sym.Name, ex.Message);
             }
         }
-        return true;
+
+        return results;
+    }
+
+    private static string EscapeCsv(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        if (s.Contains(",") || s.Contains("\"") || s.Contains("\n"))
+            return "\"" + s.Replace("\"", "\"\"") + "\"";
+        return s;
     }
 
     private sealed class PeImage
@@ -212,7 +348,6 @@ internal static class Pesym
         public List<Section> Sections = new List<Section>();
         private uint _exportRva;
         private uint _importRva;
-
         private bool _isPe32Plus;
 
         public static PeImage Parse(byte[] data)
@@ -222,24 +357,19 @@ internal static class Pesym
             uint peOff = ReadU32(data, 0x3C);
             if (peOff + 4 > data.Length || data[peOff] != 'P' || data[peOff + 1] != 'E' || data[peOff + 2] != 0 || data[peOff + 3] != 0)
                 throw new Exception("PE signature not found");
-
             var pe = new PeImage { _data = data };
             ushort numSections = ReadU16(data, (int)peOff + 6);
             ushort sizeOptHeader = ReadU16(data, (int)peOff + 20);
-
             int optStart = (int)peOff + 24;
             ushort magic = ReadU16(data, optStart);
             if (magic != 0x10B && magic != 0x20B) throw new Exception("unknown optional header");
             pe._isPe32Plus = (magic == 0x20B);
-
             pe.ImageBase = magic == 0x20B
                 ? ReadU64(data, optStart + 24)
                 : ReadU32(data, optStart + 28);
-
             int dataDirStart = optStart + (magic == 0x20B ? 112 : 96);
-            pe._exportRva = ReadU32(data, dataDirStart); // DataDirectory[0] = export
-            pe._importRva = ReadU32(data, dataDirStart + 8); // DataDirectory[1] = import
-
+            pe._exportRva = ReadU32(data, dataDirStart);
+            pe._importRva = ReadU32(data, dataDirStart + 8);
             int secStart = optStart + sizeOptHeader;
             for (int i = 0; i < numSections && i < 96; i++)
             {
@@ -265,14 +395,11 @@ internal static class Pesym
             if (_exportRva == 0) return list;
             long dirOff = RvaToFileOffset(_exportRva) ?? -1;
             if (dirOff < 0 || dirOff + 40 > _data.Length) return list;
-
             uint numNames = ReadU32(_data, dirOff + 24);
             uint addrNames = ReadU32(_data, dirOff + 32);
             if (numNames == 0 || numNames > 1000000) return list;
-
             long namesOff = RvaToFileOffset(addrNames) ?? -1;
             if (namesOff < 0) return list;
-
             for (uint i = 0; i < numNames; i++)
             {
                 if (namesOff + (i + 1) * 4 > _data.Length) break;
@@ -288,23 +415,18 @@ internal static class Pesym
         {
             var list = new List<Symbol>();
             if (_importRva == 0) return list;
-
             int size = 0;
             for (uint rva = _importRva; ; rva += 20)
             {
                 long? off = RvaToFileOffset(rva);
                 if (!off.HasValue || off.Value + 20 > _data.Length) break;
-                if (ReadU32(_data, off.Value) == 0 &&
-                    ReadU32(_data, off.Value + 12) == 0) break; // terminator entry
-
+                if (ReadU32(_data, off.Value) == 0 && ReadU32(_data, off.Value + 12) == 0) break;
                 uint originalThunk = ReadU32(_data, off.Value);
                 uint firstThunk = ReadU32(_data, off.Value + 16);
                 if (originalThunk == 0 || firstThunk == 0) continue;
-
                 uint thunkRva = originalThunk != 0 ? originalThunk : firstThunk;
                 long? thunkOff = RvaToFileOffset(thunkRva);
                 if (!thunkOff.HasValue) continue;
-
                 for (uint i = 0; ; i++)
                 {
                     uint entryRva = thunkRva + i * 4;
@@ -312,84 +434,64 @@ internal static class Pesym
                     if (!eo.HasValue || eo.Value + 4 > _data.Length) break;
                     uint entry = ReadU32(_data, eo.Value);
                     if (entry == 0) break;
-
                     string name;
                     if ((entry & 0x80000000) != 0)
                     {
-                        name = "#" + (entry & 0xFFFF); // import by ordinal
+                        name = "#" + (entry & 0xFFFF);
                     }
                     else
                     {
                         long? hintOff = RvaToFileOffset(entry);
                         name = hintOff.HasValue && hintOff.Value + 2 < _data.Length
-                            ? ReadCStringAt(hintOff.Value + 2) // skip Hint (2 bytes)
+                            ? ReadCStringAt(hintOff.Value + 2)
                             : null;
                     }
                     if (string.IsNullOrEmpty(name)) continue;
-
-                    // RVA of the IAT slot that holds the resolved address at runtime
                     uint iatSlotRva = firstThunk + i * 4;
-                    list.Add(new Symbol
-                    {
-                        Name = name,
-                        Source = "import",
-                        Value = iatSlotRva,
-                        RvaBased = true
-                    });
+                    list.Add(new Symbol { Name = name, Source = "import", Value = iatSlotRva, RvaBased = true });
                 }
-                if (++size > 4096) break; // sanity limit
+                if (++size > 4096) break;
             }
             return list;
         }
 
-        // Finds import thunks (linker-generated stubs like
-        // "WinVerifyTrust: jmp cs:__imp_WinVerifyTrust") in executable sections.
         public List<Symbol> GetImportThunks(List<Symbol> imports)
         {
             var list = new List<Symbol>();
             if (imports == null || imports.Count == 0) return list;
-
-            // map IAT slot RVA -> symbol name
             var iatMap = new Dictionary<uint, Symbol>();
             foreach (Symbol s in imports)
             {
                 if (!iatMap.ContainsKey(s.Value)) iatMap[s.Value] = s;
             }
-
             foreach (Section sec in Sections)
             {
                 if (!sec.IsExecutable || sec.SizeOfRawData < 6) continue;
                 long start = sec.PointerToRawData;
                 long limit = Math.Min(sec.SizeOfRawData, _data.Length - start) - 6;
-
                 for (long i = 0; i < limit; i++)
                 {
                     long p = start + i;
                     byte op0 = _data[p];
                     byte op1 = _data[p + 1];
-                    bool isJmp = (op0 == 0xFF && op1 == 0x25); // jmp [rip+disp32] / jmp [abs32]
-                    bool isCall = (op0 == 0xFF && op1 == 0x15); // call [rip+disp32]
+                    bool isJmp = (op0 == 0xFF && op1 == 0x25);
+                    bool isCall = (op0 == 0xFF && op1 == 0x15);
                     if (!isJmp && !isCall) continue;
-
                     uint insnRva = sec.VirtualAddress + (uint)i;
                     uint targetRva;
                     if (_isPe32Plus)
                     {
-                        // RIP-relative: next insn RVA = insnRva + 6
                         int disp = (int)ReadU32(_data, p + 2);
                         targetRva = unchecked(insnRva + 6 + (uint)disp);
                     }
                     else
                     {
-                        // Absolute 32-bit VA of the IAT slot.
                         uint targetVa = ReadU32(_data, p + 2);
                         if (targetVa < (uint)ImageBase || (ulong)targetVa - ImageBase > 0xFFFFFFFF) continue;
                         targetRva = (uint)((ulong)targetVa - ImageBase);
                     }
-
                     Symbol imp;
                     if (!iatMap.TryGetValue(targetRva, out imp)) continue;
-
                     var thunk = new Symbol
                     {
                         Name = imp.Name,
@@ -399,12 +501,7 @@ internal static class Pesym
                         RvaBased = true
                     };
                     list.Add(thunk);
-
-                    if (isJmp)
-                    {
-                        // stubs are 6 bytes; skip past to avoid rescanning
-                        i += 5;
-                    }
+                    if (isJmp) i += 5;
                 }
             }
             return list;
@@ -414,15 +511,13 @@ internal static class Pesym
         {
             var list = new List<Symbol>();
             uint peOff = ReadU32(_data, 0x3C);
-            uint symPtr = ReadU32(_data, (int)peOff + 12);   // PointerToSymbolTable
-            uint numSyms = ReadU32(_data, (int)peOff + 16);  // NumberOfSymbols
+            uint symPtr = ReadU32(_data, (int)peOff + 12);
+            uint numSyms = ReadU32(_data, (int)peOff + 16);
             if (symPtr == 0 || numSyms == 0 || numSyms > 10000000) return list;
             if (symPtr >= _data.Length) return list;
-
             long strTable = symPtr + numSyms * 18;
             if (strTable + 4 > _data.Length) return list;
             uint strTableSize = ReadU32(_data, strTable);
-
             uint i = 0;
             while (i < numSyms)
             {
@@ -439,14 +534,11 @@ internal static class Pesym
                 {
                     name = Encoding.ASCII.GetString(_data, (int)p, 8).TrimEnd('\0');
                 }
-
                 uint value = ReadU32(_data, p + 8);
                 short sectionNum = (short)ReadU16(_data, p + 12);
-                byte storageClass = _data[p + 16];
                 byte aux = _data[p + 17];
-
-                if (!string.IsNullOrEmpty(name) &&
-                    sectionNum > 0 && sectionNum <= Sections.Count)                {
+                if (!string.IsNullOrEmpty(name) && sectionNum > 0 && sectionNum <= Sections.Count)
+                {
                     list.Add(new Symbol
                     {
                         Name = name,
@@ -472,7 +564,6 @@ internal static class Pesym
                     return off < _data.Length ? off : (long?)null;
                 }
             }
-            // header region maps 1:1
             long hdr = rva;
             return hdr < _data.Length ? hdr : (long?)null;
         }
