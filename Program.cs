@@ -57,6 +57,168 @@ internal static class Pesym
         public bool RvaBased;
     }
 
+    // ---------------------------------------------------------------------
+    // Windowed buffered reader over a FileStream.
+    // ---------------------------------------------------------------------
+    private sealed class PeReader : IDisposable
+    {
+        private const int BufferSize = 64 * 1024;
+        private readonly FileStream _stream;
+        private readonly byte[] _buffer = new byte[BufferSize];
+        private long _bufferStart = -1;
+        private int _bufferLen;
+        public readonly long Length;
+
+        public PeReader(string path)
+        {
+            _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            Length = _stream.Length;
+        }
+
+        public bool CanRead(long offset, int len)
+        {
+            return offset >= 0 && len >= 0 && offset + len <= Length;
+        }
+
+        private void EnsureRange(long offset, int len)
+        {
+            if (offset < 0 || offset + len > Length)
+                throw new IOException("read past EOF");
+            if (_bufferStart >= 0 &&
+                offset >= _bufferStart &&
+                offset + len <= _bufferStart + _bufferLen)
+                return;
+
+            _stream.Seek(offset, SeekOrigin.Begin);
+            int toRead = (int)Math.Min(BufferSize, Length - offset);
+            int read = 0;
+            while (read < toRead)
+            {
+                int n = _stream.Read(_buffer, read, toRead - read);
+                if (n <= 0) break;
+                read += n;
+            }
+            _bufferStart = offset;
+            _bufferLen = read;
+        }
+
+        public byte ReadByte(long offset)
+        {
+            EnsureRange(offset, 1);
+            return _buffer[offset - _bufferStart];
+        }
+
+        public ushort ReadU16(long offset)
+        {
+            EnsureRange(offset, 2);
+            int i = (int)(offset - _bufferStart);
+            return (ushort)(_buffer[i] | (_buffer[i + 1] << 8));
+        }
+
+        public uint ReadU32(long offset)
+        {
+            EnsureRange(offset, 4);
+            int i = (int)(offset - _bufferStart);
+            return (uint)(_buffer[i] | (_buffer[i + 1] << 8) |
+                          (_buffer[i + 2] << 16) | (_buffer[i + 3] << 24));
+        }
+
+        public ulong ReadU64(long offset)
+        {
+            return ReadU32(offset) | ((ulong)ReadU32(offset + 4) << 32);
+        }
+
+        /// <summary>Reads a byte range into dst. For small requests uses the cache,
+        /// for large ones reads directly from the stream.</summary>
+        public int ReadBytes(long offset, byte[] dst, int dstOffset, int count)
+        {
+            if (count <= 0) return 0;
+            if (offset < 0 || offset + count > Length)
+                throw new IOException("read past EOF");
+
+            if (count <= BufferSize / 2)
+            {
+                EnsureRange(offset, count);
+                int srcIdx = (int)(offset - _bufferStart);
+                Buffer.BlockCopy(_buffer, srcIdx, dst, dstOffset, count);
+                return count;
+            }
+
+            // Large read: bypass cache.
+            _stream.Seek(offset, SeekOrigin.Begin);
+            int total = 0;
+            while (total < count)
+            {
+                int n = _stream.Read(dst, dstOffset + total, count - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            _bufferStart = -1; // invalidate cache
+            return total;
+        }
+
+        /// <summary>Reads an ASCII C-string starting at offset.</summary>
+        public string ReadCStringAt(long offset)
+        {
+            if (offset < 0 || offset >= Length) return null;
+            var sb = new StringBuilder();
+            long pos = offset;
+            while (pos < Length)
+            {
+                EnsureRange(pos, 1);
+                int idx = (int)(pos - _bufferStart);
+                int avail = _bufferLen - idx;
+                int zeroAt = -1;
+                for (int i = 0; i < avail; i++)
+                {
+                    if (_buffer[idx + i] == 0) { zeroAt = i; break; }
+                }
+                if (zeroAt >= 0)
+                {
+                    for (int i = 0; i < zeroAt; i++) sb.Append((char)_buffer[idx + i]);
+                    break;
+                }
+                for (int i = 0; i < avail; i++) sb.Append((char)_buffer[idx + i]);
+                pos += avail;
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Reads up to maxLen ASCII bytes, stopping at NUL or EOF.</summary>
+        public string ReadAsciiString(long offset, int maxLen)
+        {
+            if (offset < 0 || offset >= Length || maxLen <= 0) return "";
+            var sb = new StringBuilder(maxLen);
+            long pos = offset;
+            long endPos = Math.Min(offset + maxLen, Length);
+            while (pos < endPos)
+            {
+                EnsureRange(pos, 1);
+                int idx = (int)(pos - _bufferStart);
+                int avail = _bufferLen - idx;
+                int remaining = (int)(endPos - pos);
+                if (avail > remaining) avail = remaining;
+
+                int stopAt = avail;
+                for (int i = 0; i < avail; i++)
+                {
+                    if (_buffer[idx + i] == 0) { stopAt = i; break; }
+                }
+                for (int i = 0; i < stopAt; i++) sb.Append((char)_buffer[idx + i]);
+                if (stopAt < avail) break;
+                pos += avail;
+            }
+            return sb.ToString();
+        }
+
+        public void Dispose()
+        {
+            if (_stream != null) _stream.Dispose();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+
     private static int Main(string[] args)
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
@@ -103,16 +265,8 @@ internal static class Pesym
             foreach (string file in files)
             {
                 var results = AnalyzeFile(file, regex, opt);
-                if (results == null)
-                {
-                    exitCode = 1;
-                    continue;
-                }
-                
-                if (opt.Format == "json")
-                {
-                    allResults.AddRange(results);
-                }
+                if (results == null) { exitCode = 1; continue; }
+                if (opt.Format == "json") allResults.AddRange(results);
             }
         }
 
@@ -215,122 +369,138 @@ internal static class Pesym
 
     private static List<Dictionary<string, object>> AnalyzeFile(string path, Regex regex, Options opt)
     {
-        byte[] data;
-        try { data = File.ReadAllBytes(path); }
+        PeReader reader = null;
+        try
+        {
+            reader = new PeReader(path);
+        }
         catch (Exception ex)
         {
             Console.Error.WriteLine("pesym: cannot read {0}: {1}", path, ex.Message);
             return null;
         }
 
-        PeImage pe;
-        try { pe = PeImage.Parse(data); }
-        catch (Exception ex)
+        try
         {
-            Console.Error.WriteLine("pesym: {0}: {1}", path, ex.Message);
-            return null;
-        }
-
-        var symbols = new List<Symbol>();
-        List<Symbol> imports = null;
-
-        if (!opt.CoffOnly)
-            try { symbols.AddRange(pe.GetExports()); }
-            catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); }
-
-        if (!opt.ExportsOnly)
-            try { imports = pe.GetImports(); symbols.AddRange(imports); }
-            catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: import table error: {1}", path, ex.Message); }
-
-        if (!opt.ExportsOnly)
-            try { symbols.AddRange(pe.GetCoffSymbols()); }
-            catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); }
-
-        if (imports != null)
-            try { symbols.AddRange(pe.GetImportThunks(imports)); }
-            catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); }
-
-        var results = new List<Dictionary<string, object>>();
-        bool printedHeader = false;
-
-        foreach (Symbol sym in symbols)
-        {
-            if (sym == null || string.IsNullOrEmpty(sym.Name)) continue;
-            if (regex != null && !regex.IsMatch(sym.Name)) continue;
-
-            try
-            {
-                uint rva = sym.RvaBased ? sym.Value : 0;
-                ulong va = rva != 0 ? pe.ImageBase + rva : 0;
-                long? fileOffset = sym.RvaBased
-                    ? pe.RvaToFileOffset(rva)
-                    : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : (long?)null);
-
-                // Инициализация словаря, совместимая с C# 5.0
-                var result = new Dictionary<string, object>();
-                result.Add("file", path);
-                result.Add("source", sym.Source);
-                result.Add("name", sym.Name);
-                result.Add("rva", rva != 0 ? "0x" + rva.ToString("X") : "-");
-                result.Add("va", va != 0 ? "0x" + va.ToString("X") : "-");
-                result.Add("offset", fileOffset.HasValue ? "0x" + fileOffset.Value.ToString("X") : "?");
-                result.Add("section", sym.Section != null && sym.Section.Length > 0 ? sym.Section : "-");
-
-                results.Add(result);
-
-                // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
-                if (opt.Format == "json") continue;
-
-                if (opt.AddressesOnly)
-                {
-                    if (fileOffset.HasValue)
-                        Console.WriteLine("0x{0:X}", fileOffset.Value);
-                    else if (va != 0)
-                        Console.WriteLine("0x{0:X}", va);
-                    else if (rva != 0)
-                        Console.WriteLine("0x{0:X}", rva);
-                }
-                else if (opt.NamesOnly)
-                {
-                    Console.WriteLine(sym.Name);
-                }
-                else if (opt.Format == "raw")
-                {
-                    Console.WriteLine("{0}\t{1}\t{2}\t{3}\t{4}\t{5}",
-                        sym.Source, sym.Name, result["rva"], result["va"], result["offset"], result["section"]);
-                }
-                else if (opt.Format == "csv")
-                {
-                    if (!printedHeader && !opt.NoHeader)
-                    {
-                        Console.WriteLine("file,source,name,rva,va,offset,section");
-                        printedHeader = true;
-                    }
-                    Console.WriteLine("{0},{1},{2},{3},{4},{5},{6}",
-                        EscapeCsv(path), EscapeCsv(sym.Source), EscapeCsv(sym.Name),
-                        result["rva"], result["va"], result["offset"], EscapeCsv(result["section"].ToString()));
-                }
-                else // table format
-                {
-                    if (!printedHeader && !opt.NoHeader)
-                    {
-                        Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase);
-                        Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                            "Source", "RVA", "VA", "FileOffset", "Section", "Name");
-                        printedHeader = true;
-                    }
-                    Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
-                        sym.Source, result["rva"], result["va"], result["offset"], result["section"], sym.Name);
-                }
-            }
+            PeImage pe;
+            try { pe = PeImage.Parse(reader); }
             catch (Exception ex)
             {
-                Console.WriteLine("  {0,-10} <error resolving symbol '{1}': {2}>",
-                    sym.Source, sym.Name, ex.Message);
+                Console.Error.WriteLine("pesym: {0}: {1}", path, ex.Message);
+                return null;
             }
-        }
 
-        return results;
+            var symbols = new List<Symbol>();
+            List<Symbol> imports = null;
+
+            if (!opt.CoffOnly)
+            {
+                try { symbols.AddRange(pe.GetExports()); }
+                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: export table error: {1}", path, ex.Message); }
+            }
+
+            if (!opt.ExportsOnly)
+            {
+                try { imports = pe.GetImports(); symbols.AddRange(imports); }
+                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: import table error: {1}", path, ex.Message); }
+            }
+
+            if (!opt.ExportsOnly)
+            {
+                try { symbols.AddRange(pe.GetCoffSymbols()); }
+                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: COFF symbol table error: {1}", path, ex.Message); }
+            }
+
+            if (imports != null)
+            {
+                try { symbols.AddRange(pe.GetImportThunks(imports)); }
+                catch (Exception ex) { Console.Error.WriteLine("pesym: {0}: thunk scan error: {1}", path, ex.Message); }
+            }
+
+            var results = new List<Dictionary<string, object>>();
+            bool printedHeader = false;
+
+            foreach (Symbol sym in symbols)
+            {
+                if (sym == null || string.IsNullOrEmpty(sym.Name)) continue;
+                if (regex != null && !regex.IsMatch(sym.Name)) continue;
+
+                try
+                {
+                    uint rva = sym.RvaBased ? sym.Value : 0;
+                    ulong va = rva != 0 ? pe.ImageBase + rva : 0;
+                    long? fileOffset = sym.RvaBased
+                        ? pe.RvaToFileOffset(rva)
+                        : (pe.SectionByName(sym.Section) != null ? pe.SectionalToFileOffset(sym.Section, sym.Value) : (long?)null);
+
+                    // Инициализация словаря, совместимая с C# 5.0
+                    var result = new Dictionary<string, object>();
+                    result.Add("file", path);
+                    result.Add("source", sym.Source);
+                    result.Add("name", sym.Name);
+                    result.Add("rva", rva != 0 ? "0x" + rva.ToString("X") : "-");
+                    result.Add("va", va != 0 ? "0x" + va.ToString("X") : "-");
+                    result.Add("offset", fileOffset.HasValue ? "0x" + fileOffset.Value.ToString("X") : "?");
+                    result.Add("section", !string.IsNullOrEmpty(sym.Section) ? sym.Section : "-");
+
+                    results.Add(result);
+
+                    // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
+                    if (opt.Format == "json") continue;
+
+                    if (opt.AddressesOnly)
+                    {
+                        if (fileOffset.HasValue) Console.WriteLine("0x{0:X}", fileOffset.Value);
+                        else if (va != 0) Console.WriteLine("0x{0:X}", va);
+                        else if (rva != 0) Console.WriteLine("0x{0:X}", rva);
+                    }
+                    else if (opt.NamesOnly)
+                    {
+                        Console.WriteLine(sym.Name);
+                    }
+                    else if (opt.Format == "raw")
+                    {
+                        Console.WriteLine("{0}\t{1}\t{2}\t{3}\t{4}\t{5}",
+                            sym.Source, sym.Name, result["rva"], result["va"], result["offset"], result["section"]);
+                    }
+                    else if (opt.Format == "csv")
+                    {
+                        if (!printedHeader && !opt.NoHeader)
+                        {
+                            Console.WriteLine("file,source,name,rva,va,offset,section");
+                            printedHeader = true;
+                        }
+                        Console.WriteLine("{0},{1},{2},{3},{4},{5},{6}",
+                            EscapeCsv(path), EscapeCsv(sym.Source), EscapeCsv(sym.Name),
+                            result["rva"], result["va"], result["offset"],
+                            EscapeCsv(result["section"].ToString()));
+                    }
+                    else // table format
+                    {
+                        if (!printedHeader && !opt.NoHeader)
+                        {
+                            Console.WriteLine("== {0} (ImageBase=0x{1:X}) ==", path, pe.ImageBase);
+                            Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
+                                "Source", "RVA", "VA", "FileOffset", "Section", "Name");
+                            printedHeader = true;
+                        }
+                        Console.WriteLine("  {0,-10} {1,-12} {2,-12} {3,-12} {4,-8} {5}",
+                            sym.Source, result["rva"], result["va"], result["offset"], result["section"], sym.Name);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("  {0,-10} <error resolving symbol '{1}': {2}>",
+                        sym.Source, sym.Name, ex.Message);
+                }
+            }
+
+            return results;
+        }
+        finally
+        {
+            if (reader != null) reader.Dispose();
+        }
     }
 
     private static string EscapeCsv(string s)
@@ -343,46 +513,56 @@ internal static class Pesym
 
     private sealed class PeImage
     {
-        private byte[] _data;
+        private PeReader _reader;
         public ulong ImageBase;
         public List<Section> Sections = new List<Section>();
         private uint _exportRva;
         private uint _importRva;
         private bool _isPe32Plus;
 
-        public static PeImage Parse(byte[] data)
+        public static PeImage Parse(PeReader reader)
         {
-            if (data.Length < 0x40 || data[0] != 'M' || data[1] != 'Z')
+            if (reader.Length < 0x40)
+                throw new Exception("file too small");
+            if (reader.ReadByte(0) != 'M' || reader.ReadByte(1) != 'Z')
                 throw new Exception("not an MZ file");
-            uint peOff = ReadU32(data, 0x3C);
-            if (peOff + 4 > data.Length || data[peOff] != 'P' || data[peOff + 1] != 'E' || data[peOff + 2] != 0 || data[peOff + 3] != 0)
+
+            uint peOff = reader.ReadU32(0x3C);
+            if (peOff + 4 > reader.Length) throw new Exception("PE signature not found");
+            if (reader.ReadByte(peOff) != 'P' || reader.ReadByte(peOff + 1) != 'E' ||
+                reader.ReadByte(peOff + 2) != 0 || reader.ReadByte(peOff + 3) != 0)
                 throw new Exception("PE signature not found");
-            var pe = new PeImage { _data = data };
-            ushort numSections = ReadU16(data, (int)peOff + 6);
-            ushort sizeOptHeader = ReadU16(data, (int)peOff + 20);
+
+            var pe = new PeImage { _reader = reader };
+
+            ushort numSections = reader.ReadU16(peOff + 6);
+            ushort sizeOptHeader = reader.ReadU16(peOff + 20);
             int optStart = (int)peOff + 24;
-            ushort magic = ReadU16(data, optStart);
+            ushort magic = reader.ReadU16(optStart);
             if (magic != 0x10B && magic != 0x20B) throw new Exception("unknown optional header");
+
             pe._isPe32Plus = (magic == 0x20B);
             pe.ImageBase = magic == 0x20B
-                ? ReadU64(data, optStart + 24)
-                : ReadU32(data, optStart + 28);
+                ? reader.ReadU64(optStart + 24)
+                : reader.ReadU32(optStart + 28);
+
             int dataDirStart = optStart + (magic == 0x20B ? 112 : 96);
-            pe._exportRva = ReadU32(data, dataDirStart);
-            pe._importRva = ReadU32(data, dataDirStart + 8);
+            pe._exportRva = reader.ReadU32(dataDirStart);
+            pe._importRva = reader.ReadU32(dataDirStart + 8);
+
             int secStart = optStart + sizeOptHeader;
             for (int i = 0; i < numSections && i < 96; i++)
             {
                 int p = secStart + i * 40;
-                if (p + 40 > data.Length) break;
+                if (p + 40 > reader.Length) break;
                 var s = new Section
                 {
-                    Name = Encoding.ASCII.GetString(data, p, 8).TrimEnd('\0'),
-                    VirtualSize = ReadU32(data, p + 8),
-                    VirtualAddress = ReadU32(data, p + 12),
-                    SizeOfRawData = ReadU32(data, p + 16),
-                    PointerToRawData = ReadU32(data, p + 20),
-                    Characteristics = ReadU32(data, p + 36),
+                    Name = reader.ReadAsciiString(p, 8),
+                    VirtualSize = reader.ReadU32(p + 8),
+                    VirtualAddress = reader.ReadU32(p + 12),
+                    SizeOfRawData = reader.ReadU32(p + 16),
+                    PointerToRawData = reader.ReadU32(p + 20),
+                    Characteristics = reader.ReadU32(p + 36),
                 };
                 pe.Sections.Add(s);
             }
@@ -394,16 +574,19 @@ internal static class Pesym
             var list = new List<Symbol>();
             if (_exportRva == 0) return list;
             long dirOff = RvaToFileOffset(_exportRva) ?? -1;
-            if (dirOff < 0 || dirOff + 40 > _data.Length) return list;
-            uint numNames = ReadU32(_data, dirOff + 24);
-            uint addrNames = ReadU32(_data, dirOff + 32);
+            if (dirOff < 0 || dirOff + 40 > _reader.Length) return list;
+
+            uint numNames = _reader.ReadU32(dirOff + 24);
+            uint addrNames = _reader.ReadU32(dirOff + 32);
             if (numNames == 0 || numNames > 1000000) return list;
+
             long namesOff = RvaToFileOffset(addrNames) ?? -1;
             if (namesOff < 0) return list;
+
             for (uint i = 0; i < numNames; i++)
             {
-                if (namesOff + (i + 1) * 4 > _data.Length) break;
-                uint nameRva = ReadU32(_data, namesOff + (int)(i * 4));
+                if (namesOff + (i + 1) * 4 > _reader.Length) break;
+                uint nameRva = _reader.ReadU32(namesOff + (int)(i * 4));
                 string name = ReadCString(nameRva);
                 if (string.IsNullOrEmpty(name)) continue;
                 list.Add(new Symbol { Name = name, Source = "export", Value = nameRva, RvaBased = true });
@@ -419,21 +602,25 @@ internal static class Pesym
             for (uint rva = _importRva; ; rva += 20)
             {
                 long? off = RvaToFileOffset(rva);
-                if (!off.HasValue || off.Value + 20 > _data.Length) break;
-                if (ReadU32(_data, off.Value) == 0 && ReadU32(_data, off.Value + 12) == 0) break;
-                uint originalThunk = ReadU32(_data, off.Value);
-                uint firstThunk = ReadU32(_data, off.Value + 16);
+                if (!off.HasValue || off.Value + 20 > _reader.Length) break;
+                if (_reader.ReadU32(off.Value) == 0 && _reader.ReadU32(off.Value + 12) == 0) break;
+
+                uint originalThunk = _reader.ReadU32(off.Value);
+                uint firstThunk = _reader.ReadU32(off.Value + 16);
                 if (originalThunk == 0 || firstThunk == 0) continue;
+
                 uint thunkRva = originalThunk != 0 ? originalThunk : firstThunk;
                 long? thunkOff = RvaToFileOffset(thunkRva);
                 if (!thunkOff.HasValue) continue;
+
                 for (uint i = 0; ; i++)
                 {
                     uint entryRva = thunkRva + i * 4;
                     long? eo = RvaToFileOffset(entryRva);
-                    if (!eo.HasValue || eo.Value + 4 > _data.Length) break;
-                    uint entry = ReadU32(_data, eo.Value);
+                    if (!eo.HasValue || eo.Value + 4 > _reader.Length) break;
+                    uint entry = _reader.ReadU32(eo.Value);
                     if (entry == 0) break;
+
                     string name;
                     if ((entry & 0x80000000) != 0)
                     {
@@ -442,11 +629,12 @@ internal static class Pesym
                     else
                     {
                         long? hintOff = RvaToFileOffset(entry);
-                        name = hintOff.HasValue && hintOff.Value + 2 < _data.Length
-                            ? ReadCStringAt(hintOff.Value + 2)
+                        name = hintOff.HasValue && hintOff.Value + 2 < _reader.Length
+                            ? _reader.ReadCStringAt(hintOff.Value + 2)
                             : null;
                     }
                     if (string.IsNullOrEmpty(name)) continue;
+
                     uint iatSlotRva = firstThunk + i * 4;
                     list.Add(new Symbol { Name = name, Source = "import", Value = iatSlotRva, RvaBased = true });
                 }
@@ -459,49 +647,80 @@ internal static class Pesym
         {
             var list = new List<Symbol>();
             if (imports == null || imports.Count == 0) return list;
+
             var iatMap = new Dictionary<uint, Symbol>();
             foreach (Symbol s in imports)
             {
                 if (!iatMap.ContainsKey(s.Value)) iatMap[s.Value] = s;
             }
+
+            // Sliding window scan: keeps memory bounded even for large .text sections.
+            const int CHUNK = 64 * 1024;
+            const int OVERLAP = 16;
+            byte[] chunk = new byte[CHUNK + OVERLAP];
+
             foreach (Section sec in Sections)
             {
                 if (!sec.IsExecutable || sec.SizeOfRawData < 6) continue;
+
                 long start = sec.PointerToRawData;
-                long limit = Math.Min(sec.SizeOfRawData, _data.Length - start) - 6;
-                for (long i = 0; i < limit; i++)
+                long avail = _reader.Length - start;
+                if (avail <= 0) continue;
+                long rawSize = Math.Min((long)sec.SizeOfRawData, avail);
+                long limit = rawSize - 6;
+                if (limit < 0) continue;
+
+                long pos = start;
+                long endPos = start + limit;
+                while (pos < endPos)
                 {
-                    long p = start + i;
-                    byte op0 = _data[p];
-                    byte op1 = _data[p + 1];
-                    bool isJmp = (op0 == 0xFF && op1 == 0x25);
-                    bool isCall = (op0 == 0xFF && op1 == 0x15);
-                    if (!isJmp && !isCall) continue;
-                    uint insnRva = sec.VirtualAddress + (uint)i;
-                    uint targetRva;
-                    if (_isPe32Plus)
+                    int toRead = (int)Math.Min(chunk.Length, endPos - pos);
+                    int read = _reader.ReadBytes(pos, chunk, 0, toRead);
+                    if (read <= 6) break;
+
+                    int scanLimit = read - 6;
+                    for (int i = 0; i < scanLimit; i++)
                     {
-                        int disp = (int)ReadU32(_data, p + 2);
-                        targetRva = unchecked(insnRva + 6 + (uint)disp);
+                        byte op0 = chunk[i];
+                        byte op1 = chunk[i + 1];
+                        bool isJmp = (op0 == 0xFF && op1 == 0x25);
+                        bool isCall = (op0 == 0xFF && op1 == 0x15);
+                        if (!isJmp && !isCall) continue;
+
+                        uint insnRva = sec.VirtualAddress + (uint)(pos - start + i);
+                        uint targetRva;
+
+                        if (_isPe32Plus)
+                        {
+                            int disp = (int)(chunk[i + 2] | (chunk[i + 3] << 8) |
+                                             (chunk[i + 4] << 16) | (chunk[i + 5] << 24));
+                            targetRva = unchecked(insnRva + 6 + (uint)disp);
+                        }
+                        else
+                        {
+                            uint targetVa = (uint)(chunk[i + 2] | (chunk[i + 3] << 8) |
+                                                   (chunk[i + 4] << 16) | (chunk[i + 5] << 24));
+                            if (targetVa < (uint)ImageBase ||
+                                (ulong)targetVa - ImageBase > 0xFFFFFFFF) continue;
+                            targetRva = (uint)((ulong)targetVa - ImageBase);
+                        }
+
+                        Symbol imp;
+                        if (!iatMap.TryGetValue(targetRva, out imp)) continue;
+
+                        list.Add(new Symbol
+                        {
+                            Name = imp.Name,
+                            Source = isJmp ? "thunk" : "thunk-call",
+                            Value = insnRva,
+                            Section = sec.Name,
+                            RvaBased = true
+                        });
+                        if (isJmp) i += 5;
                     }
-                    else
-                    {
-                        uint targetVa = ReadU32(_data, p + 2);
-                        if (targetVa < (uint)ImageBase || (ulong)targetVa - ImageBase > 0xFFFFFFFF) continue;
-                        targetRva = (uint)((ulong)targetVa - ImageBase);
-                    }
-                    Symbol imp;
-                    if (!iatMap.TryGetValue(targetRva, out imp)) continue;
-                    var thunk = new Symbol
-                    {
-                        Name = imp.Name,
-                        Source = isJmp ? "thunk" : "thunk-call",
-                        Value = insnRva,
-                        Section = sec.Name,
-                        RvaBased = true
-                    };
-                    list.Add(thunk);
-                    if (isJmp) i += 5;
+
+                    if (read < chunk.Length) break;
+                    pos += read - OVERLAP;
                 }
             }
             return list;
@@ -510,33 +729,40 @@ internal static class Pesym
         public List<Symbol> GetCoffSymbols()
         {
             var list = new List<Symbol>();
-            uint peOff = ReadU32(_data, 0x3C);
-            uint symPtr = ReadU32(_data, (int)peOff + 12);
-            uint numSyms = ReadU32(_data, (int)peOff + 16);
+            uint peOff = _reader.ReadU32(0x3C);
+            if (peOff + 20 > _reader.Length) return list;
+
+            uint symPtr = _reader.ReadU32(peOff + 12);
+            uint numSyms = _reader.ReadU32(peOff + 16);
             if (symPtr == 0 || numSyms == 0 || numSyms > 10000000) return list;
-            if (symPtr >= _data.Length) return list;
-            long strTable = symPtr + numSyms * 18;
-            if (strTable + 4 > _data.Length) return list;
-            uint strTableSize = ReadU32(_data, strTable);
+            if (symPtr >= _reader.Length) return list;
+
+            long strTable = (long)symPtr + (long)numSyms * 18;
+            if (strTable + 4 > _reader.Length) return list;
+            uint strTableSize = _reader.ReadU32(strTable);
+
             uint i = 0;
             while (i < numSyms)
             {
                 long p = (long)symPtr + (long)i * 18;
-                if (p < 0 || p + 18 > _data.Length) break;
+                if (p < 0 || p + 18 > _reader.Length) break;
+
                 string name;
-                if (ReadU32(_data, p) == 0)
+                if (_reader.ReadU32(p) == 0)
                 {
-                    uint strOff = ReadU32(_data, p + 4);
-                    name = (strOff + 4 < strTableSize && strTable + strOff < _data.Length)
-                        ? ReadCStringAt(strTable + strOff) : null;
+                    uint strOff = _reader.ReadU32(p + 4);
+                    name = (strOff + 4 < strTableSize && strTable + strOff < _reader.Length)
+                        ? _reader.ReadCStringAt(strTable + strOff) : null;
                 }
                 else
                 {
-                    name = Encoding.ASCII.GetString(_data, (int)p, 8).TrimEnd('\0');
+                    name = _reader.ReadAsciiString(p, 8);
                 }
-                uint value = ReadU32(_data, p + 8);
-                short sectionNum = (short)ReadU16(_data, p + 12);
-                byte aux = _data[p + 17];
+
+                uint value = _reader.ReadU32(p + 8);
+                short sectionNum = (short)_reader.ReadU16(p + 12);
+                byte aux = _reader.ReadByte(p + 17);
+
                 if (!string.IsNullOrEmpty(name) && sectionNum > 0 && sectionNum <= Sections.Count)
                 {
                     list.Add(new Symbol
@@ -561,11 +787,11 @@ internal static class Pesym
                 if (rva >= s.VirtualAddress && rva < s.VirtualAddress + size)
                 {
                     long off = (long)s.PointerToRawData + (rva - s.VirtualAddress);
-                    return off < _data.Length ? off : (long?)null;
+                    return off < _reader.Length ? off : (long?)null;
                 }
             }
             long hdr = rva;
-            return hdr < _data.Length ? hdr : (long?)null;
+            return hdr < _reader.Length ? hdr : (long?)null;
         }
 
         public Section SectionByName(string name)
@@ -584,30 +810,7 @@ internal static class Pesym
         private string ReadCString(uint rva)
         {
             long? off = RvaToFileOffset(rva);
-            return off.HasValue ? ReadCStringAt(off.Value) : null;
+            return off.HasValue ? _reader.ReadCStringAt(off.Value) : null;
         }
-
-        private string ReadCStringAt(long offset)
-        {
-            if (offset < 0 || offset >= _data.Length) return null;
-            long end = offset;
-            while (end < _data.Length && _data[end] != 0) end++;
-            return Encoding.ASCII.GetString(_data, (int)offset, (int)(end - offset));
-        }
-    }
-
-    private static ushort ReadU16(byte[] b, long o)
-    {
-        return (ushort)(b[o] | (b[o + 1] << 8));
-    }
-
-    private static uint ReadU32(byte[] b, long o)
-    {
-        return (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
-    }
-
-    private static ulong ReadU64(byte[] b, long o)
-    {
-        return ReadU32(b, o) | ((ulong)ReadU32(b, o + 4) << 32);
     }
 }
