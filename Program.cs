@@ -407,9 +407,9 @@ internal static class Pesym
         Console.WriteLine("  --               separate options from positional arguments (pattern/address and files)");
         Console.WriteLine();
         Console.WriteLine("Output options:");
-        Console.WriteLine("  -q               quiet mode (output addresses only)");
+        Console.WriteLine("  -q, --quiet      quiet mode (output addresses only)");
         Console.WriteLine("  --addr <type>    address type for quiet mode: rva, va, offset (default)");
-        Console.WriteLine("  -n               output names only (one per line)");
+        Console.WriteLine("  -n, --names-only output names only (one per line)");
         Console.WriteLine("  --no-header      suppress table headers");
         Console.WriteLine("  -f <format>      output format: table (default), raw, csv, json");
         Console.WriteLine();
