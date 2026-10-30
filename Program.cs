@@ -21,6 +21,9 @@ using System.Text.RegularExpressions;
 
 internal static class Pesym
 {
+    /// <summary>
+    /// Holds command-line options and configuration settings for the utility.
+    /// </summary>
     private sealed class Options
     {
         public string Pattern;
@@ -29,21 +32,24 @@ internal static class Pesym
         public bool IgnoreCase = true;
         public bool All;
         
-        // Таблицы для поиска (export, import, coff, thunk, thunk-call, all)
+        // Tables to search (export, import, coff, thunk, thunk-call, all)
         public HashSet<string> Tables = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "all" };
         
-        // Опции для гибкого вывода
+        // Options for flexible output
         public bool Quiet;
         public string AddrType = "offset"; // rva, va, offset
         public bool NamesOnly;
         public bool NoHeader;
         public string Format = "table"; // table, raw, csv, json
         
-        // Опции для патчинга
+        // Options for patching
         public byte[] PatchData;
         public long? PatchOffset;
     }
 
+    /// <summary>
+    /// Represents a PE file section header and its metadata.
+    /// </summary>
     private sealed class Section
     {
         public string Name;
@@ -55,6 +61,9 @@ internal static class Pesym
         public bool IsExecutable { get { return (Characteristics & 0x20000000) != 0; } }
     }
 
+    /// <summary>
+    /// Represents an individual symbol found within the PE file structure.
+    /// </summary>
     private sealed class Symbol
     {
         public string Name;
@@ -262,7 +271,7 @@ internal static class Pesym
         
         if (opt == null) { PrintUsage(); return 0; }
 
-        // Режим прямого патчинга по указанному адресу
+        // Direct patching mode by specified address
         if (opt.PatchData != null && opt.PatchOffset.HasValue)
         {
             int exitCode = 0;
@@ -345,7 +354,7 @@ internal static class Pesym
             }
         }
 
-        // Безопасный вывод JSON без использования форматных строк Console.WriteLine
+        // Safe JSON output without using Console.WriteLine format strings
         if (opt.Format == "json" && !opt.Quiet && allResults.Count > 0)
         {
             Console.WriteLine("[");
@@ -361,7 +370,7 @@ internal static class Pesym
                 Console.Write("\"offset\":\"" + Convert.ToString(r["offset"]) + "\",");
                 Console.Write("\"section\":\"" + EscapeJson(Convert.ToString(r["section"])) + "\"");
                 
-                // Добавляем запятую для всех элементов, кроме последнего
+                // Add a comma for all elements except the last one
                 string comma = (i < allResults.Count - 1) ? "," : "";
                 Console.WriteLine("}" + comma);
             }
@@ -420,7 +429,7 @@ internal static class Pesym
             else if (a == "-c" || a == "/c") opt.IgnoreCase = false;
             else if (a == "-l" || a == "/l") opt.All = true;
             
-            // Новый аргумент для выбора таблицы
+            // New argument for selecting a symbol table
             else if (a == "-t" || a == "/t" || a == "--table")
             {
                 if (i + 1 >= args.Length) throw new Exception("missing table name after -t");
@@ -441,7 +450,7 @@ internal static class Pesym
             // Quiet mode
             else if (a == "-q" || a == "/q" || a == "--quiet") opt.Quiet = true;
             
-            // Тип адреса для quiet mode
+            // Address type for quiet mode
             else if (a == "--addr")
             {
                 if (i + 1 >= args.Length) throw new Exception("missing address type after --addr");
@@ -467,7 +476,7 @@ internal static class Pesym
             }
             else if (a == "--")
             {
-                // Все последующие аргументы считаем позиционными
+                // Treat all subsequent arguments as positional
                 for (int j = i + 1; j < args.Length; j++)
                 {
                     string posArg = args[j];
@@ -484,14 +493,14 @@ internal static class Pesym
                         opt.Files.Add(posArg);
                     }
                 }
-                break; // Завершаем основной цикл парсинга
+                break; // Finish the main parsing loop
             }
             else if (a == "-h" || a == "/h" || a == "--help") return null;
             else if (a.Length > 1 && (a[0] == '-' || a[0] == '/'))
                 throw new Exception("unknown option: " + a);
             else if (opt.Pattern == null && !opt.All)
             {
-                // Поддержка адреса без явного использования "--"
+                // Support for address without explicitly using "--"
                 if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(a))
                     opt.PatchOffset = ParseAddress(a);
                 else
@@ -548,7 +557,7 @@ internal static class Pesym
             {
                 if (sym == null || string.IsNullOrEmpty(sym.Name)) continue;
                 
-                // Фильтрация по запрошенным таблицам (например, отсечь thunk, если просили только thunk-call)
+                // Filter by requested tables (e.g., exclude thunk if only thunk-call was requested)
                 if (!searchAll && !opt.Tables.Contains(sym.Source)) continue;
 
                 if (regex != null && !regex.IsMatch(sym.Name)) continue;
@@ -566,7 +575,7 @@ internal static class Pesym
                         offsetsToPatch.Add(fileOffset.Value);
                     }
                     
-                    // Если включен Quiet mode, просто печатаем нужный адрес и идем дальше
+                    // If Quiet mode is enabled, simply print the requested address and continue
                     if (opt.Quiet)
                     {
                         string outAddr = "-";
@@ -578,7 +587,7 @@ internal static class Pesym
                         continue;
                     }
 
-                    // Инициализация словаря, совместимая с C# 5.0
+                    // Dictionary initialization compatible with C# 5.0
                     var result = new Dictionary<string, object>();
                     result.Add("file", path);
                     result.Add("source", sym.Source);
@@ -590,7 +599,7 @@ internal static class Pesym
 
                     results.Add(result);
 
-                    // Вывод в зависимости от формата (JSON обрабатывается отдельно в Main)
+                    // Output depending on format (JSON is processed separately in Main)
                     if (opt.Format == "json") continue;
 
                     if (opt.NamesOnly) Console.WriteLine(sym.Name);
@@ -616,10 +625,10 @@ internal static class Pesym
         }
         finally
         {
-            if (reader != null) reader.Dispose(); // Закрываем файл для чтения, чтобы освободить для записи
+            if (reader != null) reader.Dispose(); // Close the reader stream to release the file for writing
         }
 
-        // Выполняем патчинг после того, как PeReader освободил файл
+        // Perform patching after PeReader has released the file
         if (opt.PatchData != null && offsetsToPatch.Count > 0)
         {
             if (!CheckFileWritable(path)) return results;
@@ -704,6 +713,9 @@ internal static class Pesym
         return Convert.ToInt64(s, 16);
     }
 
+    /// <summary>
+    /// Parses and manages PE image structures, sections, and symbol tables.
+    /// </summary>
     private sealed class PeImage
     {
         private PeReader _reader;
