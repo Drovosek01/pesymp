@@ -674,8 +674,7 @@ internal static class Pesym
     {
         if (string.IsNullOrEmpty(hex)) throw new Exception("empty hex data");
         hex = hex.Replace(" ", "").Replace("-", "");
-        if (hex.Length % 2 != 0)
-            throw new Exception("hex string length must be even");
+        if (hex.Length % 2 != 0) throw new Exception("hex string length must be even");
         
         byte[] bytes = new byte[hex.Length / 2];
         for (int i = 0; i < bytes.Length; i++)
@@ -716,10 +715,8 @@ internal static class Pesym
 
         public static PeImage Parse(PeReader reader)
         {
-            if (reader.Length < 0x40)
-                throw new Exception("file too small");
-            if (reader.ReadByte(0) != 'M' || reader.ReadByte(1) != 'Z')
-                throw new Exception("not an MZ file");
+            if (reader.Length < 0x40) throw new Exception("file too small");
+            if (reader.ReadByte(0) != 'M' || reader.ReadByte(1) != 'Z') throw new Exception("not an MZ file");
 
             uint peOff = reader.ReadU32(0x3C);
             if (peOff + 4 > reader.Length) throw new Exception("PE signature not found");
@@ -801,7 +798,7 @@ internal static class Pesym
 
                 uint originalThunk = _reader.ReadU32(off.Value);
                 uint firstThunk = _reader.ReadU32(off.Value + 16);
-                if (originalThunk == 0 || firstThunk == 0) continue;
+                if (originalThunk == 0 && firstThunk == 0) continue;
 
                 uint thunkRva = originalThunk != 0 ? originalThunk : firstThunk;
                 long? thunkOff = RvaToFileOffset(thunkRva);
@@ -888,7 +885,7 @@ internal static class Pesym
                         {
                             int disp = (int)(chunk[i + 2] | (chunk[i + 3] << 8) |
                                              (chunk[i + 4] << 16) | (chunk[i + 5] << 24));
-                            targetRva = unchecked(insnRva + 6 + (uint)disp);
+                            targetRva = unchecked((uint)((long)insnRva + 6 + disp));
                         }
                         else
                         {
