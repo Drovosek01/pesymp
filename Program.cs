@@ -225,7 +225,28 @@ internal static class Pesym
     }
 
     // ---------------------------------------------------------------------
+    // Helper to check if file can be modified
+    // ---------------------------------------------------------------------
+    private static bool CheckFileWritable(string path)
+    {
+        try
+        {
+            FileAttributes attrs = File.GetAttributes(path);
+            if ((attrs & FileAttributes.ReadOnly) != 0)
+            {
+                Console.Error.WriteLine("pesym: {0}: file is marked as read-only", path);
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("pesym: {0}: cannot check file attributes: {1}", path, ex.Message);
+            return false;
+        }
+    }
 
+    // ---------------------------------------------------------------------
     private static int Main(string[] args)
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
@@ -247,13 +268,20 @@ internal static class Pesym
             int exitCode = 0;
             foreach (string file in opt.Files)
             {
+                if (!CheckFileWritable(file)) { exitCode = 1; continue; }
+
                 try
                 {
                     using (var fs = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                     {
                         long off = opt.PatchOffset.Value;
                         if (off < 0 || off + opt.PatchData.Length > fs.Length)
-                            throw new Exception(string.Format("offset 0x{0:X} + {1} bytes out of file bounds (size: {2})", off, opt.PatchData.Length, fs.Length));
+                        {
+                            Console.Error.WriteLine("pesym: {0}: offset 0x{1:X} + {2} bytes out of file bounds (file size: 0x{3:X})", 
+                                file, off, opt.PatchData.Length, fs.Length);
+                            exitCode = 1;
+                            continue;
+                        }
                         
                         fs.Seek(off, SeekOrigin.Begin);
                         fs.Write(opt.PatchData, 0, opt.PatchData.Length);
@@ -261,6 +289,16 @@ internal static class Pesym
                         if (!opt.Quiet)
                             Console.WriteLine("Patched {0} at offset 0x{1:X} with {2} bytes", file, off, opt.PatchData.Length);
                     }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    Console.Error.WriteLine("pesym: {0}: access denied (file might be locked by another process or OS)", file);
+                    exitCode = 1;
+                }
+                catch (IOException ioEx)
+                {
+                    Console.Error.WriteLine("pesym: {0}: I/O error (file might be in use): {1}", file, ioEx.Message);
+                    exitCode = 1;
                 }
                 catch (Exception ex)
                 {
@@ -584,6 +622,8 @@ internal static class Pesym
         // Выполняем патчинг после того, как PeReader освободил файл
         if (opt.PatchData != null && offsetsToPatch.Count > 0)
         {
+            if (!CheckFileWritable(path)) return results;
+
             try
             {
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
@@ -592,7 +632,7 @@ internal static class Pesym
                     {
                         if (off < 0 || off + opt.PatchData.Length > fs.Length)
                         {
-                            Console.Error.WriteLine("pesym: {0}: patch offset 0x{1:X} out of bounds", path, off);
+                            Console.Error.WriteLine("pesym: {0}: patch offset 0x{1:X} + {2} bytes out of file bounds (file size: 0x{3:X})", path, off, opt.PatchData.Length, fs.Length);
                             continue;
                         }
                         fs.Seek(off, SeekOrigin.Begin);
@@ -601,6 +641,14 @@ internal static class Pesym
                             Console.WriteLine("Patched {0} at offset 0x{1:X} with {2} bytes", path, off, opt.PatchData.Length);
                     }
                 }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine("pesym: {0}: access denied (file might be locked by another process or OS)", path);
+            }
+            catch (IOException ioEx)
+            {
+                Console.Error.WriteLine("pesym: {0}: I/O error (file might be in use): {1}", path, ioEx.Message);
             }
             catch (Exception ex)
             {
