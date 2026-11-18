@@ -319,7 +319,7 @@ internal static class Pesym
         }
 
         Regex regex = null;
-        if (!opt.All)
+        if (!opt.All && opt.Pattern != null)
         {
             var opts = RegexOptions.CultureInvariant;
             if (opt.IgnoreCase) opts |= RegexOptions.IgnoreCase;
@@ -422,12 +422,28 @@ internal static class Pesym
     private static Options ParseArgs(string[] args)
     {
         var opt = new Options();
+        var positionals = new List<string>();
+        bool afterDoubleDash = false;
+
+        // Pass 1: collect all options and positional arguments.
+        // Options are recognized in any position, before or after file paths.
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
-            if (a == "-r" || a == "/r") opt.Regex = true;
-            else if (a == "-c" || a == "/c") opt.IgnoreCase = false;
-            else if (a == "-l" || a == "/l") opt.All = true;
+            if (afterDoubleDash || a.Length == 0 || a[0] != '-')
+            {
+                positionals.Add(a);
+                continue;
+            }
+
+            if (a == "-" || a == "/-") { positionals.Add(a); continue; }
+
+            // Normalize Windows-style option prefixes (/r -> -r)
+            if (a[0] == '/' && a.Length > 1) a = "-" + a.Substring(1);
+
+            if (a == "-r") opt.Regex = true;
+            else if (a == "-c") opt.IgnoreCase = false;
+            else if (a == "-l") opt.All = true;
             
             // New argument for selecting a symbol table
             else if (a == "-t" || a == "/t" || a == "--table")
@@ -448,7 +464,7 @@ internal static class Pesym
             }
             
             // Quiet mode
-            else if (a == "-q" || a == "/q" || a == "--quiet") opt.Quiet = true;
+            else if (a == "-q" || a == "--quiet") opt.Quiet = true;
             
             // Address type for quiet mode
             else if (a == "--addr")
@@ -459,16 +475,16 @@ internal static class Pesym
                     throw new Exception("unknown address type: " + at + ". Use rva, va, or offset.");
                 opt.AddrType = at;
             }
-            else if (a == "-n" || a == "/n" || a == "--names-only") opt.NamesOnly = true;
+            else if (a == "-n" || a == "--names-only") opt.NamesOnly = true;
             else if (a == "--no-header") opt.NoHeader = true;
-            else if (a == "-f" || a == "/f" || a == "--format")
+            else if (a == "-f" || a == "--format")
             {
                 if (i + 1 >= args.Length) throw new Exception("missing format after -f");
                 opt.Format = args[++i].ToLower();
                 if (opt.Format != "table" && opt.Format != "raw" && opt.Format != "csv" && opt.Format != "json")
                     throw new Exception("unknown format: " + opt.Format);
             }
-            else if (a == "-x" || a == "/x" || a == "--hex")
+            else if (a == "-x" || a == "--hex")
             {
                 if (i + 1 >= args.Length) throw new Exception("missing hex data after -x");
                 try { opt.PatchData = ParseHex(args[++i]); }
@@ -476,44 +492,50 @@ internal static class Pesym
             }
             else if (a == "--")
             {
-                // Treat all subsequent arguments as positional
-                for (int j = i + 1; j < args.Length; j++)
-                {
-                    string posArg = args[j];
-                    if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(posArg))
-                    {
-                        opt.PatchOffset = ParseAddress(posArg);
-                    }
-                    else if (opt.Pattern == null && !opt.All && opt.PatchOffset == null)
-                    {
-                        opt.Pattern = posArg;
-                    }
-                    else
-                    {
-                        opt.Files.Add(posArg);
-                    }
-                }
-                break; // Finish the main parsing loop
+                afterDoubleDash = true;
             }
-            else if (a == "-h" || a == "/h" || a == "--help") return null;
-            else if (a.Length > 1 && (a[0] == '-' || a[0] == '/'))
-                throw new Exception("unknown option: " + a);
-            else if (opt.Pattern == null && !opt.All)
-            {
-                // Support for address without explicitly using "--"
-                if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(a))
-                    opt.PatchOffset = ParseAddress(a);
-                else
-                    opt.Pattern = a;
-            }
-            else opt.Files.Add(a);
+            else if (a == "-h" || a == "--help") return null;
+            else throw new Exception("unknown option: " + args[i]);
         }
 
-        if (!opt.All && opt.Pattern == null && !opt.PatchOffset.HasValue) 
+        // Pass 2: classify positional arguments. An argument that exists on
+        // disk is treated as a file; the rest are pattern candidates (the
+        // first one is the pattern, the others fall back to files as before).
+        var patternCandidates = new List<string>();
+        foreach (string a in positionals)
+        {
+            if (opt.PatchData != null && opt.PatchOffset == null && IsHexAddress(a))
+            {
+                opt.PatchOffset = ParseAddress(a);
+            }
+            else if (File.Exists(a))
+            {
+                opt.Files.Add(a);
+            }
+            else
+            {
+                patternCandidates.Add(a);
+            }
+        }
+
+        if (patternCandidates.Count > 0)
+        {
+            opt.Pattern = patternCandidates[0];
+            // Backwards compatibility for the classic order
+            // "pesymp <pattern> <files...>" when the files are not on disk
+            // yet (e.g. wildcards like *.dll) or paths contain typos.
+            if (opt.Files.Count == 0 && patternCandidates.Count > 1 && !opt.PatchOffset.HasValue)
+            {
+                for (int i = 1; i < patternCandidates.Count; i++)
+                    opt.Files.Add(patternCandidates[i]);
+            }
+        }
+
+        if (!opt.All && opt.Pattern == null && !opt.PatchOffset.HasValue)
             throw new Exception("no pattern given (or use -l, or specify address with -x)");
-        if (opt.Files.Count == 0) 
+        if (opt.Files.Count == 0)
             throw new Exception("no input file given");
-            
+
         return opt;
     }
 
